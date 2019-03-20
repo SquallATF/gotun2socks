@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/yinghuocho/gosocks"
 	"github.com/yinghuocho/gotun2socks/internal/packet"
 )
 
@@ -50,7 +49,7 @@ type tcpConnTrack struct {
 	quitByOther  chan bool
 
 	localSocksAddr string
-	socksConn      *gosocks.SocksConn
+	socksConn      net.Conn
 
 	// tcp context
 	state tcpState
@@ -244,14 +243,14 @@ func rstByPacket(pkt *tcpPacket) *tcpPacket {
 }
 
 func (tt *tcpConnTrack) changeState(nxt tcpState) {
-	// log.Printf("### [%s -> %s]", tcpstateString(tt.state), tcpstateString(nxt))
+	log.Printf("### [%s -> %s]", tcpstateString(tt.state), tcpstateString(nxt))
 	tt.state = nxt
 }
 
 func (tt *tcpConnTrack) validAck(pkt *tcpPacket) bool {
 	ret := (pkt.tcp.Ack == tt.nxtSeq)
 	if !ret {
-		// log.Printf("WARNING: invalid ack: recvd: %d, expecting: %d", pkt.tcp.Ack, tt.nxtSeq)
+		log.Printf("WARNING: invalid ack: recvd: %d, expecting: %d", pkt.tcp.Ack, tt.nxtSeq)
 	}
 	return ret
 }
@@ -288,7 +287,7 @@ func (tt *tcpConnTrack) relayPayload(pkt *tcpPacket) bool {
 }
 
 func (tt *tcpConnTrack) send(pkt *tcpPacket) {
-	// log.Printf("<-- [TCP][%s][%s][seq:%d][ack:%d][payload:%d]", tt.id, tcpflagsString(pkt.tcp), pkt.tcp.Seq, pkt.tcp.Ack, len(pkt.tcp.Payload))
+	//log.Printf("<-- [TCP][%s][%s][seq:%d][ack:%d][payload:%d]", tt.id, tcpflagsString(pkt.tcp), pkt.tcp.Seq, pkt.tcp.Ack, len(pkt.tcp.Payload))
 	if pkt.tcp.ACK {
 		tt.lastAck = pkt.tcp.Ack
 	}
@@ -400,7 +399,7 @@ func (tt *tcpConnTrack) payload(data []byte) {
 func (tt *tcpConnTrack) stateClosed(syn *tcpPacket) (continu bool, release bool) {
 	var e error
 	for i := 0; i < 2; i++ {
-		tt.socksConn, e = dialLocalSocks(tt.localSocksAddr)
+		tt.socksConn, e = tt.t2s.dialer.Dial("tcp4", syn.ip.DstIP.String(), syn.tcp.DstPort, tt.t2s.ctx)
 		if e != nil {
 			log.Printf("fail to connect SOCKS proxy: %s", e)
 		} else {
@@ -412,7 +411,7 @@ func (tt *tcpConnTrack) stateClosed(syn *tcpPacket) (continu bool, release bool)
 	if tt.socksConn == nil {
 		resp := rstByPacket(syn)
 		tt.toTunCh <- resp.wire
-		// log.Printf("<-- [TCP][%s][RST]", tt.id)
+		log.Printf("<-- [TCP][%s][RST]", tt.id)
 		return false, true
 	}
 	// context variables
@@ -425,31 +424,32 @@ func (tt *tcpConnTrack) stateClosed(syn *tcpPacket) (continu bool, release bool)
 }
 
 func (tt *tcpConnTrack) tcpSocks2Tun(dstIP net.IP, dstPort uint16, conn net.Conn, readCh chan<- []byte, writeCh <-chan *tcpPacket, closeCh chan bool) {
-	_, e := gosocks.WriteSocksRequest(conn, &gosocks.SocksRequest{
-		Cmd:      gosocks.SocksCmdConnect,
-		HostType: gosocks.SocksIPv4Host,
-		DstHost:  dstIP.String(),
-		DstPort:  dstPort,
-	})
-	if e != nil {
-		log.Printf("error to send socks request: %s", e)
-		conn.Close()
-		close(closeCh)
-		return
-	}
-	reply, e := gosocks.ReadSocksReply(conn)
-	if e != nil {
-		log.Printf("error to read socks reply: %s", e)
-		conn.Close()
-		close(closeCh)
-		return
-	}
-	if reply.Rep != gosocks.SocksSucceeded {
-		log.Printf("socks connect request fail, retcode: %d", reply.Rep)
-		conn.Close()
-		close(closeCh)
-		return
-	}
+	/*
+		_, e := gosocks.WriteSocksRequest(conn, &gosocks.SocksRequest{
+			Cmd:      gosocks.SocksCmdConnect,
+			HostType: gosocks.SocksIPv4Host,
+			DstHost:  dstIP.String(),
+			DstPort:  dstPort,
+		})
+		if e != nil {
+			log.Printf("error to send socks request: %s", e)
+			conn.Close()
+			close(closeCh)
+			return
+		}
+		reply, e := gosocks.ReadSocksReply(conn)
+		if e != nil {
+			log.Printf("error to read socks reply: %s", e)
+			conn.Close()
+			close(closeCh)
+			return
+		}
+		if reply.Rep != gosocks.SocksSucceeded {
+			log.Printf("socks connect request fail, retcode: %d", reply.Rep)
+			conn.Close()
+			close(closeCh)
+			return
+		}*/
 	// writer
 	go func() {
 	loop:
@@ -528,7 +528,7 @@ func (tt *tcpConnTrack) stateSynRcvd(pkt *tcpPacket) (continu bool, release bool
 		if !pkt.tcp.RST {
 			resp := rstByPacket(pkt)
 			tt.toTunCh <- resp
-			// log.Printf("<-- [TCP][%s][RST] continue", tt.id)
+			log.Printf("<-- [TCP][%s][RST] continue", tt.id)
 		}
 		return true, true
 	}
@@ -699,7 +699,7 @@ func (tt *tcpConnTrack) run() {
 
 		select {
 		case pkt := <-tt.input:
-			// log.Printf("--> [TCP][%s][%s][%s][seq:%d][ack:%d][payload:%d]", tt.id, tcpstateString(tt.state), tcpflagsString(pkt.tcp), pkt.tcp.Seq, pkt.tcp.Ack, len(pkt.tcp.Payload))
+			//log.Printf("--> [TCP][%s][%s][%s][seq:%d][ack:%d][payload:%d]", tt.id, tcpstateString(tt.state), tcpflagsString(pkt.tcp), pkt.tcp.Seq, pkt.tcp.Ack, len(pkt.tcp.Payload))
 			var continu, release bool
 
 			tt.updateSendWindow(pkt)
@@ -826,15 +826,15 @@ func (t2s *Tun2Socks) tcp(raw []byte, ip *packet.IPv4, tcp *packet.TCP) {
 	} else {
 		// ignore RST, if there is no track of this connection
 		if tcp.RST {
-			// log.Printf("--> [TCP][%s][%s]", connID, tcpflagsString(tcp))
+			log.Printf("--> [TCP][%s][%s]", connID, tcpflagsString(tcp))
 			return
 		}
 		// return a RST to non-SYN packet
 		if !tcp.SYN {
-			// log.Printf("--> [TCP][%s][%s]", connID, tcpflagsString(tcp))
+			log.Printf("--> [TCP][%s][%s]", connID, tcpflagsString(tcp))
 			resp := rst(ip.SrcIP, ip.DstIP, tcp.SrcPort, tcp.DstPort, tcp.Seq, tcp.Ack, uint32(len(tcp.Payload)))
 			t2s.writeCh <- resp
-			// log.Printf("<-- [TCP][%s][RST]", connID)
+			log.Printf("<-- [TCP][%s][RST]", connID)
 			return
 		}
 		pkt := copyTCPPacket(raw, ip, tcp)

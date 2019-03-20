@@ -1,14 +1,15 @@
 package gotun2socks
 
 import (
+	"context"
 	"io"
 	"log"
 	"net"
 	"sync"
-	"time"
 
-	"github.com/yinghuocho/gosocks"
 	"github.com/yinghuocho/gotun2socks/internal/packet"
+
+	"github.com/xiaokangwang/waVingOcean/definition"
 )
 
 const (
@@ -16,11 +17,6 @@ const (
 )
 
 var (
-	localSocksDialer *gosocks.SocksDialer = &gosocks.SocksDialer{
-		Auth:    &gosocks.AnonymousClientAuthenticator{},
-		Timeout: 1 * time.Second,
-	}
-
 	_, ip1, _ = net.ParseCIDR("10.0.0.0/8")
 	_, ip2, _ = net.ParseCIDR("172.16.0.0/12")
 	_, ip3, _ = net.ParseCIDR("192.168.0.0/24")
@@ -44,20 +40,20 @@ type Tun2Socks struct {
 	cache      *dnsCache
 
 	wg sync.WaitGroup
+
+	ctx    context.Context
+	dialer definition.SurrogateDialer
 }
 
 func isPrivate(ip net.IP) bool {
 	return ip1.Contains(ip) || ip2.Contains(ip) || ip3.Contains(ip)
 }
 
-func dialLocalSocks(localAddr string) (*gosocks.SocksConn, error) {
-	return localSocksDialer.Dial(localAddr)
-}
-
-func New(dev io.ReadWriteCloser, localSocksAddr string, dnsServers []string, publicOnly bool, enableDnsCache bool) *Tun2Socks {
+func New(dev io.ReadWriteCloser, dialer definition.SurrogateDialer, dnsServers []string, publicOnly bool, enableDnsCache bool, ctx context.Context) *Tun2Socks {
 	t2s := &Tun2Socks{
 		dev:             dev,
-		localSocksAddr:  localSocksAddr,
+		dialer:          dialer,
+		ctx:             ctx,
 		publicOnly:      publicOnly,
 		writerStopCh:    make(chan bool, 10),
 		writeCh:         make(chan interface{}, 10000),
@@ -116,6 +112,9 @@ func (t2s *Tun2Socks) Run() {
 			case <-t2s.writerStopCh:
 				log.Printf("quit tun2socks writer")
 				return
+			case <-t2s.ctx.Done():
+				log.Printf("quit tun2socks writer: Context is done")
+				return
 			}
 		}
 	}()
@@ -129,6 +128,10 @@ func (t2s *Tun2Socks) Run() {
 	t2s.wg.Add(1)
 	defer t2s.wg.Done()
 	for {
+		if t2s.ctx.Err() != nil {
+			log.Printf("quit tun2socks reader: Context is done")
+			return
+		}
 		n, e := t2s.dev.Read(buf[:])
 		if e != nil {
 			// TODO: stop at critical error
